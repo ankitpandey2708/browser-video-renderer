@@ -1,0 +1,21 @@
+{
+  "name": "browser-video-renderer",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Turn any URL into a smooth MP4 by virtualizing time in headless Chrome.",
+  "bin": {
+    "render": "render.js"
+  },
+  "scripts": {
+    "demo": "node render.js demo-av.html",
+    "postinstall": "rebrowser-patches patch --packageName playwright-core || echo \"rebrowser patch skipped -- stealth/Cloudflare reach will be weaker (see docs/cloudflare-stealth.md)\""
+  },
+  "dependencies": {
+    "mp4box": "^2.4.1",
+    "playwright": "1.52.0",
+    "playwright-core": "1.52.0"
+  },
+  "devDependencies": {
+    "rebrowser-patches": "^1.0.19"
+  }
+}

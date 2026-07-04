@@ -1,0 +1,82 @@
+# browser-video-renderer
+
+**Turn any web page into a repeatable, frame-accurate video — without changing the page.**
+
+Point it at a URL or an AI-generated HTML file; it films the page as video — scrolling, clicking, and driving the UI first — and captures animation, embedded video, and audio-reactive visuals with frame-accurate *timing*, the same way every run (byte-identical on a given machine). No SDK, no rewrite, no timing marks.
+
+---
+
+## 1. What we've built
+
+A working CLI today (single machine, MIT):
+
+- **Deterministic capture of *any* page.** A fake clock replaces `Date`/`rAF`/timers in headless Chrome; we step time frame-by-frame, screenshot, encode with FFmpeg. A 60-second animation renders frame-accurately regardless of machine speed — and the page never knows it's being filmed.
+- **Drive it first** — scroll, click, type, and timed mid-capture actions (`--do "click #x@2"`).
+- **Repeatable renders** — seeded `Math.random`/`crypto` + a frozen clock make a page render byte-identical on the same machine/Chrome build; the basis for reliable visual diffing. (Pixel-perfect *compositor* determinism would need Chrome's `beginFrame`, removed in 147+; we pin the *timing* via `page.screenshot()`, not the compositor.)
+- **Real media** — deterministic `<video>` decode via WebCodecs, multi-clip + trim; output mp4/webm/mov/mkv/gif, PNG sequence, transparent (alpha), and stills across h264/h265/av1/vp9/vp8/prores.
+- **The hard part — audio.** Two passes: render the page's *real* Web Audio graph on an `OfflineAudioContext` (captures **`AudioWorkletNode`** DSP), then feed that PCM back to a shimmed **`AnalyserNode`** so audio-reactive visualizers actually react — deterministically.
+- Plus captions from the page's own audio, and batch/templated renders.
+
+**We've found no other tool that captures AudioWorklet DSP or audio-reactive visuals from a page it didn't author** — and we've verified ours does, end-to-end.
+
+---
+
+## 2. Why it's ours
+
+Browsers are real-time systems, not frame-accurate recorders — filming a page means controlling time, audio, and rendering *from the outside*. Incumbents dodge this by making the **author build for capture** (Remotion = React `useCurrentFrame`; HyperFrames = HTML `data-*` marks). That breaks on AI-generated pages, where there's no author to cooperate. **Our bet: the page shouldn't have to** — the axis they're not architected for.
+
+---
+
+## 3. The wedge
+
+> **Preview what an AI coding agent just built — as video.** Cursor, v0, Replit, Codex ship UIs constantly; a screenshot misses the motion and the interaction. We film the generated page as-is, zero cooperation required.
+
+**Adjacent, same capability:** deterministic visual-regression of *animation* in CI — today's tools disable animation because it makes screenshot tests flaky; our byte-identical renders don't have to.
+
+**Market status, honestly:** demand is *inferred*, not yet proven by us. HyperFrames hit ~33k stars in ~2 years (as of Jul 2026) and Replit's "browsers don't want to be cameras" post went wide — the *problem* is felt. Whether teams pay for *video specifically* is what we test first.
+
+---
+
+## 4. Vs. the field
+
+| | Remotion | HyperFrames | browser-video-renderer |
+|---|---|---|---|
+| Input | React code | HTML + `data-*` marks | **any URL / HTML** |
+| Films pages not built for capture? | No | No | **Yes** |
+| AudioWorklet / audio-reactive capture | No | No | **Yes** |
+| Repeatability | `useCurrentFrame` | seekable libs | frozen clock + seeded RNG |
+| Maturity | v4, ~200 pkgs, 52k★ | v0.7, ships at HeyGen, 33k★ | **working demo, 0★** |
+| Scale | Lambda / Cloud Run | 24 workers / Lambda / Cloud Run | **single machine** |
+| License | paid >3 staff | Apache-2.0 | MIT |
+
+Edge = a capability they don't have and aren't built for (zero-touch capture + real audio). Gaps = maturity and scale — execution, not invention.
+
+**Why they won't just add it:** both models *assume a cooperating author* (Remotion's React frames, HyperFrames' `data-*` marks). Zero-touch capture of a page nobody built for it cuts against that core architecture — it's a different product, not a feature they bolt on in a sprint. Star/package counts above are as of Jul 2026.
+
+---
+
+## 5. Today → next
+
+- **Today:** §1 works on one machine, verified end-to-end.
+- **Not yet (pre-product):** cloud/parallel rendering, an HTTP render API, SSRF protection, GTM. Determinism also excludes live network data — a limit the competitors share.
+- **Plan — validation, not projections:** (1) ship a GitHub Action ("PR → preview video") + an AudioWorklet-capture writeup, and measure install/inbound signal; (2) land 5–10 design partners in AI-coding / CI; (3) *then* build the cloud render API the demand justifies.
+
+No revenue curve from a 0-star demo — the next milestone is validated demand.
+
+---
+
+## 6. Team
+
+**Ankit Pandey** — *[FILL IN: 1–2 lines — prior roles, and the browser/rendering, media, or dev-tools background that makes you the right person to build this.]* *[Co-founders / advisors, if any — otherwise state "solo founder, hiring 1–2 with the round."]*
+
+---
+
+## 7. Ask
+
+Pre-seed. ~12 months, 2–3 people, to harden the engine, ship the Action + render API, and turn the technical story into design partners. If demand is real, that's the seed; if not, we'll have a great open-source tool and a cheap, clear answer.
+
+**In one line:** we built the one thing Remotion and HyperFrames can't — frame-accurate, audio-complete video from a page nobody built for capture — and we're raising a small round to learn how many people need it.
+
+---
+
+*2026-07-04 · single-machine CLI, MIT · [github.com/ankitpandey2708/browser-video-renderer](https://github.com/ankitpandey2708/browser-video-renderer)*

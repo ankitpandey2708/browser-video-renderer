@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>audio + video torture test</title>
+    <style>
+      * { margin: 0; box-sizing: border-box; }
+      body {
+        height: 100vh;
+        background: radial-gradient(120% 120% at 50% 0%, #10233a 0%, #05060f 60%);
+        color: #eef;
+        font: 600 16px/1.2 "Segoe UI", system-ui, sans-serif;
+        overflow: hidden;
+      }
+      .stage { position: relative; height: 100%; }
+      .ball {
+        position: absolute; width: 44px; height: 44px; margin: -22px 0 0 -22px;
+        border-radius: 50%;
+        background: radial-gradient(circle at 35% 30%, #fff, #33d6ff 45%, #1148ff);
+        box-shadow: 0 0 30px 6px rgba(51, 214, 255, 0.6);
+      }
+      .clip {
+        position: absolute; top: 50%; left: 50%;
+        width: 320px; height: 240px; margin: -120px 0 0 -160px;
+        border-radius: 14px; overflow: hidden;
+        box-shadow: 0 20px 60px rgba(0,0,0,.5); outline: 1px solid rgba(255,255,255,.15);
+      }
+      .clip video { width: 100%; height: 100%; object-fit: cover; display: block; }
+      .hud { position: absolute; top: 24px; left: 24px; font-variant-numeric: tabular-nums; }
+      .hud .big { font-size: 40px; font-weight: 800; }
+      .hud .dim { opacity: .6; font-weight: 500; font-size: 13px; margin-top: 6px; }
+      .bleep {
+        position: absolute; bottom: 26px; left: 50%; transform: translateX(-50%);
+        font-size: 22px; opacity: .9; min-height: 26px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="stage">
+      <div class="clip"><video id="clip" src="assets/clip.mp4" autoplay loop playsinline></video></div>
+      <div class="ball" id="ball"></div>
+      <div class="hud">
+        <div class="big" id="frames">frame 0</div>
+        <div class="dim" id="time">t = 0.000s</div>
+        <div class="dim" id="label"></div>
+      </div>
+      <div class="bleep" id="bleep"></div>
+    </div>
+
+    <script>
+      const ball = document.getElementById("ball");
+      const framesEl = document.getElementById("frames");
+      const timeEl = document.getElementById("time");
+      const bleepEl = document.getElementById("bleep");
+      const clip = document.getElementById("clip");
+      let frameCount = 0;
+
+      // #4: --data is injected as window.__params before this script runs. Try:
+      //   node render.js demo-av.html --data '{"label":"hello","accent":"#ff5c8a"}'
+      const params = window.__params || {};
+      document.getElementById("label").textContent =
+        params.label ? "--data label: " + params.label : "--data: (none)";
+      if (params.accent)
+        ball.style.background = "radial-gradient(circle at 35% 30%, #fff, " + params.accent + " 60%, " + params.accent + ")";
+
+      clip.volume = 0.25; // the video's own 220Hz track, muxed as background
+
+      // A2: don't start recording until the video's first frame is decodable.
+      window.__renderReady = false;
+      const markReady = () => (window.__renderReady = true);
+      if (clip.readyState >= 2) markReady();
+      else clip.addEventListener("loadeddata", markReady);
+
+      function loop(now) {
+        frameCount++;
+        const t = now / 1000;
+        const cx = window.innerWidth / 2;
+        const cy = window.innerHeight / 2;
+        ball.style.left = cx + Math.cos(t * 2.2) * 260 + "px";
+        ball.style.top = cy + Math.sin(t * 2.2) * 160 + "px";
+        framesEl.textContent = "frame " + frameCount;
+        timeEl.textContent = "t = " + t.toFixed(3) + "s";
+        requestAnimationFrame(loop);
+      }
+      requestAnimationFrame(loop);
+
+      const flash = (label) => { bleepEl.textContent = label; setTimeout(() => (bleepEl.textContent = ""), 350); };
+
+      // Path A -- HTMLAudioElement (B2 patch #6)
+      function elementPing(file, label) { new Audio(file).play(); flash(label); }
+
+      // Path B -- full Web Audio graph: fetch -> decodeAudioData -> GainNode -> start
+      // (B2 patches #1, #3, #4, #5; GainNode(0.5) proves the volume-graph walk).
+      let actx;
+      async function webAudioPing(file, gainVal, label) {
+        actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+        const audioBuf = await actx.decodeAudioData(await (await fetch(file)).arrayBuffer());
+        const src = actx.createBufferSource();
+        src.buffer = audioBuf;
+        const gain = actx.createGain();
+        gain.gain.value = gainVal;
+        src.connect(gain);
+        gain.connect(actx.destination);
+        src.start();
+        flash(label);
+      }
+
+      setTimeout(() => elementPing("assets/beep-a.mp3", "♪ C5 (element)"), 1000);
+      setTimeout(() => webAudioPing("assets/beep-b.mp3", 0.5, "♪ E5 (webaudio @0.5)"), 2500);
+      setTimeout(() => elementPing("assets/beep-c.mp3", "♪ G5 (element)"), 3800);
+    </script>
+  </body>
+</html>
