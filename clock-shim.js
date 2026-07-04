@@ -410,6 +410,13 @@
         }
       }
 
+      // 2b. Seek SVG SMIL (<animate>/<animateTransform>/<set>) to virtual time.
+      // Their timeline runs on the SVG document clock (real time), invisible to
+      // getAnimations(); pause it and setCurrentTime so it tracks our clock.
+      for (const svg of document.querySelectorAll("svg")) {
+        try { svg.pauseAnimations(); svg.setCurrentTime(elapsed / 1000); } catch (e) {}
+      }
+
       // 3. Seek every <video> to virtual time (unless a decoder owns it -- B1).
       for (const v of document.querySelectorAll("video")) {
         // Log the video's own audio track once (its file URL is fetchable), so

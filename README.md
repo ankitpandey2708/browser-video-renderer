@@ -75,6 +75,9 @@ list of flags.
 - **`--cookies` format & how to get the file:** accepts a JSON `Cookie[]` or `{ "cookies": [...] }`. On modern Chrome (v127+) cookies use App-Bound Encryption and can't be read from outside the browser, so export them from *inside* Chrome — e.g. the [`@steipete/sweet-cookie`](https://github.com/steipete/sweet-cookie) MV3 extension → "Download JSON". This carries `httpOnly` session cookies too; we replay them into a fresh context.
 - **Bot-protected (Cloudflare) pages — automatic, no flag:** for external URLs, the renderer detects a bot wall (`cf-mitigated` header / challenge markers) and transparently switches to *stealth mode* — real Chrome (**headful**) + [rebrowser-patched](https://github.com/rebrowser/rebrowser-patches) Playwright + a *dormant-shim* load: it injects the clock shim dormant so the challenge clears on a real clock, then freezes the clock in place to capture deterministically (no reload — these sites re-challenge on every navigation). Example: `node render.js "https://codepen.io/GreenSock/full/BaarZmV"`. Beats managed/invisible challenges on a clean home IP **and needs a real desktop session** (headful — not a headless server); won't beat interactive Turnstile / Enterprise zones (use `--cookies` or capture out-of-band). Full details + the Patchright/rebrowser/nodriver rationale: [`docs/cloudflare-stealth.md`](docs/cloudflare-stealth.md).
 - **Video trim-in** (no flag): a [W3C Media Fragment](https://www.w3.org/TR/media-frags/) on the page's own `<video>` — `src="clip.mp4#t=5,10"` plays the 5–10s slice (`#t=5` = from 5s to the end). Multiple videos, per-clip volume, offset, and `playbackRate` already work.
+- **Animated images** (no flag): `gif` / `apng` / `webp` `<img>`s play on the browser's own clock, which the frozen virtual clock can't drive → non-deterministic frames. They're decoded up front via `ImageDecoder` and seeked to virtual time, so they animate smoothly and identically every run (`media-decoder.js`). Static images are left untouched.
+- **SVG SMIL** (no flag): `<animate>` / `<animateTransform>` / `<set>` timelines are seeked to virtual time (`svg.setCurrentTime`), so SMIL-animated SVGs advance deterministically instead of freezing.
+- **Transparent video** (no flag): give a `<video>` a luma-mask companion — `<video src="v.mp4" maskSrc="mask.mp4">` (or `data-mask`) — white = opaque, black = transparent. The mask's luminance becomes the canvas alpha, so the page shows through. Great for overlaying a subject with no background box.
 
 ## How it works
 
@@ -119,8 +122,8 @@ list of flags.
 ## Files
 
 ```
-clock-shim.js      fake clock + seed + CSS/video seek (w/ #t= trim) + audio (offline render, AnalyserNode, wiretap)
-video-decoder.js   <video> decode: mp4box -> WebCodecs -> canvas (w/ #t= trim)
+clock-shim.js      fake clock + seed + CSS/SVG-SMIL/video seek (w/ #t= trim) + audio (offline render, AnalyserNode, wiretap)
+media-decoder.js   deterministic media: <video> (mp4box->WebCodecs, #t= trim + luma-mask transparency) + animated <img> gif/apng/webp (ImageDecoder) -> canvas, seeked to virtual time
 media-fragment.js  W3C media-fragment (#t=start,end) parser
 captions.js        ASR (whisper.cpp / OpenAI) -> .srt sidecar + optional burn-in
 render.js          CLI: static server, two-pass audio, drive clock, capture, mux

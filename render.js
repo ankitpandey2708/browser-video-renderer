@@ -790,6 +790,8 @@ function printHelp() {
   p("                     pages render authenticated (JSON: a cookie array or {cookies:[..]},");
   p("                     e.g. from the sweet-cookie extension)");
   p('\nVideo trim-in: media fragment on the page\'s <video> -- src="clip.mp4#t=5,10"');
+  p('Transparent video: a luma-mask companion -- <video src="v.mp4" maskSrc="mask.mp4">');
+  p("Animated GIF/APNG/WebP and SVG SMIL (<animate>) are captured deterministically.");
 }
 
 async function main() {
@@ -929,13 +931,31 @@ async function renderOne(args, params) {
   // WebCodecs (mp4box + our decoder). Inject with addScriptTag (real <script>,
   // global scope) -- addInitScript wraps code in a function, so mp4box's global
   // would never reach window.
+  // Deterministic media: decode <video> (mp4box+WebCodecs) and animated <img>
+  // (gif/apng/webp via ImageDecoder) onto canvases seeked to virtual time --
+  // media-decoder.js handles both. mp4box is only needed for the <video> path.
+  // addScriptTag (real <script>, global scope) -- addInitScript wraps in a
+  // function, so mp4box's global would never reach window.
   const hasVideo = await page.evaluate(() => !!document.querySelector("video"));
-  const useDecoder = hasVideo;
-  if (useDecoder) {
-    await page.addScriptTag({ content: fs.readFileSync(path.join(__dirname, "vendor/mp4box.iife.js"), "utf8") });
-    await page.addScriptTag({ content: loadShim("video-decoder.js") });
+  const hasAnimImg = await page.evaluate(() =>
+    [...document.querySelectorAll("img")].some((i) => /\.(gif|apng|webp|png)(\?|#|$)/i.test(i.currentSrc || i.src || "")));
+  // The decoder is injected as a real <script> (addScriptTag) so mp4box's global
+  // reaches window -- but that path is subject to the page's CSP. On strict-CSP
+  // sites (codepen, stripe, ...) the inline <script> is refused; decode is only
+  // an enhancement, so degrade to native <video>/<img> rendering instead of
+  // aborting the whole render (mirrors the h264 -> native seek fallback).
+  let decodeInjected = hasVideo || hasAnimImg;
+  if (decodeInjected) {
+    try {
+      if (hasVideo)
+        await page.addScriptTag({ content: fs.readFileSync(path.join(__dirname, "vendor/mp4box.iife.js"), "utf8") });
+      await page.addScriptTag({ content: loadShim("media-decoder.js") });
+    } catch (e) {
+      decodeInjected = false;
+      console.log(`  (media decode unavailable: ${String(e.message || e).split("\n")[0]}; using native playback)`);
+    }
   }
-  if (hasVideo) await waitVideosReady(page, useDecoder ? 20000 : 5000); // decode needs longer
+  if (decodeInjected) await waitVideosReady(page, hasVideo ? 20000 : 8000); // decode needs longer
 
   // A: scripted interactions -- after load/readiness, before the capture loop.
   await runInteractions(page, args, frameInterval);
@@ -1099,9 +1119,9 @@ async function renderOne(args, params) {
   await ffmpegDone;
 
   const events = await page.evaluate(() => window.__vclock.audioEvents());
-  if (useDecoder) {
+  if (decodeInjected) {
     const ds = await page.evaluate(() => window.__decoderStats);
-    console.log(`  decode: ${ds.videos} video(s), ${ds.frames} frames decoded` +
+    console.log(`  decode: ${ds.videos} video(s), ${ds.images || 0} image(s), ${ds.frames} frames decoded` +
       (ds.errors.length ? `, errors: ${ds.errors.slice(0, 3).join(" | ")}` : ""));
   }
   await close();

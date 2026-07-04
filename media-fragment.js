@@ -2,7 +2,7 @@
 // Shared video-timing helpers used both in Node and inside the injected page
 // shims. Two ways of loading, which is why everything here is plain functions
 // with a guarded module.exports: require()d in Node (render.js), and prepended
-// as a string to the shims (clock-shim.js / video-decoder.js can't require --
+// as a string to the shims (clock-shim.js / media-decoder.js can't require --
 // see render.js loadShim). Keeping the single copy here removes what used to be
 // three hand-synced duplicates.
 //
