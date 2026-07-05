@@ -4,6 +4,8 @@
 
 Point it at a URL or an AI-generated HTML file; it films the page as video — scrolling, clicking, and driving the UI first — and captures animation, embedded video, and audio-reactive visuals with frame-accurate *timing*, the same way every run (byte-identical on a given machine). No SDK, no rewrite, no timing marks.
 
+> **The primitive, in one line:** a browser where time is a variable you control, plus a camera that fires every time you advance it — a `<video>` camera for any webpage, running at any speed, forward-only, deterministic, with no human watching.
+
 ---
 
 ## 1. What we've built
@@ -13,8 +15,9 @@ A working CLI today (single machine, MIT):
 - **Deterministic capture of *any* page.** A fake clock replaces `Date`/`rAF`/timers in headless Chrome; we step time frame-by-frame, screenshot, encode with FFmpeg. A 60-second animation renders frame-accurately regardless of machine speed — and the page never knows it's being filmed.
 - **Drive it first** — scroll, click, type, and timed mid-capture actions (`--do "click #x@2"`).
 - **Repeatable renders** — seeded `Math.random`/`crypto` + a frozen clock make a page render byte-identical on the same machine/Chrome build; the basis for reliable visual diffing. (Pixel-perfect *compositor* determinism would need Chrome's `beginFrame`, removed in 147+; we pin the *timing* via `page.screenshot()`, not the compositor.)
-- **Real media** — deterministic `<video>` decode via WebCodecs, multi-clip + trim; output mp4/webm/mov/mkv/gif, PNG sequence, transparent (alpha), and stills across h264/h265/av1/vp9/vp8/prores.
+- **Real media** — deterministic `<video>` decode via WebCodecs, multi-clip + trim; animated GIF/APNG/WebP decoded onto the virtual clock (even on strict-CSP sites, via a CSP-exempt injection path); output mp4/webm/mov/mkv/gif, PNG sequence, transparent (alpha), and stills across h264/h265/av1/vp9/vp8/prores.
 - **The hard part — audio.** Two passes: render the page's *real* Web Audio graph on an `OfflineAudioContext` (captures **`AudioWorkletNode`** DSP), then feed that PCM back to a shimmed **`AnalyserNode`** so audio-reactive visualizers actually react — deterministically.
+- **Reaches the real web** — auto-detects Cloudflare and switches to a stealth path (real Chrome + deferred clock) so bot-walled pages (CodePen, Stripe, product pages) render instead of getting blocked.
 - Plus captions from the page's own audio, and batch/templated renders.
 
 **We've found no other tool that captures AudioWorklet DSP or audio-reactive visuals from a page it didn't author** — and we've verified ours does, end-to-end.
@@ -24,6 +27,8 @@ A working CLI today (single machine, MIT):
 ## 2. Why it's ours
 
 Browsers are real-time systems, not frame-accurate recorders — filming a page means controlling time, audio, and rendering *from the outside*. Incumbents dodge this by making the **author build for capture** (Remotion = React `useCurrentFrame`; HyperFrames = HTML `data-*` marks). That breaks on AI-generated pages, where there's no author to cooperate. **Our bet: the page shouldn't have to** — the axis they're not architected for.
+
+The barrier was never *"can I build this visual?"* — the web renders SVG, Canvas, WebGL, CSS, DOM, fonts, video, audio, and 3D on one composable surface. The barrier has always been **getting it out as video.** We are that missing pipe.
 
 ---
 
@@ -37,25 +42,41 @@ Browsers are real-time systems, not frame-accurate recorders — filming a page 
 
 ---
 
-## 4. Vs. the field
+## 4. Where it applies — the demand surface
+
+The primitive is horizontal: URL in, video out. We test the AI-preview wedge (§3) first, but the *same capability, no new code* serves a broad surface. Each of these is a place a team currently screen-records, hires an editor, hand-writes export code, or gives up:
+
+- **Automated data-viz & chart video** (finance / analytics / BI). A team generating ~50 animated ECharts/D3 chart videos per quarter loops one command instead of screen-recording 50× or writing per-library Canvas export. `for chart in charts/*.html; do node render.js "$chart" --duration 5 ...; done`
+- **Product-demo generation** (SaaS marketing). An interactive demo goes stale on every ship; an editor costs ~$500/round. Script the UI on a timeline, regenerate on every deploy, and let `--baseline` catch visual regressions — the demo stays in sync at **zero marginal cost**.
+- **Animation regression testing in CI** (design systems). A `cubic-bezier` tweak subtly breaks a button animation — invisible to a screenshot test. `--baseline` extends snapshot testing into the **time dimension**, fails the PR, and surfaces the worst-differing frame before it ships.
+- **Competitive & product intelligence.** Every competitor landing page is Cloudflare-walled. A weekly cron captures them frame-accurately in stealth mode; teams diff week-over-week. **Impossible without the stealth path** — which is the point.
+- **Audio-reactive export** (creator / edtech). A browser DAW or music-ed platform lets students export a project with the waveform display animating *in sync* with the audio. The two-pass audio pipeline captures both; screen-recording a tab can't.
+- **Automated social content** (marketing / media). Nightly: fetch headlines → render an animated-typography template with `--data '{...}'` → post to Reels/Shorts via API. **No designer, no editor, no After Effects license** — just HTML, CSS, and cron.
+
+The addressable surface is the union of the above plus everything adjacent to screen recording, motion graphics, and programmatic-video APIs — large and expanding, because the trigger is always the same unmet need: *turn a web page into video, by code, reliably.*
+
+---
+
+## 5. Vs. the field
 
 | | Remotion | HyperFrames | browser-video-renderer |
 |---|---|---|---|
 | Input | React code | HTML + `data-*` marks | **any URL / HTML** |
 | Films pages not built for capture? | No | No | **Yes** |
 | AudioWorklet / audio-reactive capture | No | No | **Yes** |
+| Reaches bot-walled ("real web") pages? | N/A | N/A | **Yes (stealth path)** |
 | Repeatability | `useCurrentFrame` | seekable libs | frozen clock + seeded RNG |
 | Maturity | v4, ~200 pkgs, 52k★ | v0.7, ships at HeyGen, 33k★ | **working demo, 0★** |
 | Scale | Lambda / Cloud Run | 24 workers / Lambda / Cloud Run | **single machine** |
 | License | paid >3 staff | Apache-2.0 | MIT |
 
-Edge = a capability they don't have and aren't built for (zero-touch capture + real audio). Gaps = maturity and scale — execution, not invention.
+Edge = a capability they don't have and aren't built for (zero-touch capture + real audio + the real web). Gaps = maturity and scale — execution, not invention.
 
 **Why they won't just add it:** both models *assume a cooperating author* (Remotion's React frames, HyperFrames' `data-*` marks). Zero-touch capture of a page nobody built for it cuts against that core architecture — it's a different product, not a feature they bolt on in a sprint. Star/package counts above are as of Jul 2026.
 
 ---
 
-## 5. Today → next
+## 6. Today → next
 
 - **Today:** §1 works on one machine, verified end-to-end.
 - **Not yet (pre-product):** cloud/parallel rendering, an HTTP render API, SSRF protection, GTM. Determinism also excludes live network data — a limit the competitors share.
@@ -65,13 +86,13 @@ No revenue curve from a 0-star demo — the next milestone is validated demand.
 
 ---
 
-## 6. Team
+## 7. Team
 
 **Ankit Pandey** — *[FILL IN: 1–2 lines — prior roles, and the browser/rendering, media, or dev-tools background that makes you the right person to build this.]* *[Co-founders / advisors, if any — otherwise state "solo founder, hiring 1–2 with the round."]*
 
 ---
 
-## 7. Ask
+## 8. Ask
 
 Pre-seed. ~12 months, 2–3 people, to harden the engine, ship the Action + render API, and turn the technical story into design partners. If demand is real, that's the seed; if not, we'll have a great open-source tool and a cheap, clear answer.
 
@@ -79,4 +100,4 @@ Pre-seed. ~12 months, 2–3 people, to harden the engine, ship the Action + rend
 
 ---
 
-*2026-07-04 · single-machine CLI, MIT · [github.com/ankitpandey2708/browser-video-renderer](https://github.com/ankitpandey2708/browser-video-renderer)*
+*2026-07-05 · single-machine CLI, MIT · [github.com/ankitpandey2708/browser-video-renderer](https://github.com/ankitpandey2708/browser-video-renderer)*
