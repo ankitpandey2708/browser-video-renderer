@@ -57,10 +57,9 @@ list of flags.
 | **Data** | `--data <json\|@file>` | Optional | — | inject as `window.__params` before page scripts (URL query params also work) |
 | **Captions** | `--captions` | Optional | off | transcribe the page's own audio → `<out>.srt` sidecar (non-destructive) |
 | **Captions** | `--burn` | Optional | off | additionally hardsub the captions into the video |
-| **Visual regression** | `--baseline <file>` | Optional | — | compare render to this baseline; **exits 1 on regression** (for CI); writes `<out>.diff.mp4` (+ `<out>.diff.worst.png` on fail). A missing baseline is saved automatically |
+| **Visual regression** | `--baseline <file>` | Optional | — | compare render to this baseline via an **exact per-frame hash** (renders are byte-deterministic, so there's no tolerance to tune); **exits 1 on any changed frame** (for CI). On failure writes `<out>.diff.mp4` (+ `<out>.diff.worst.png`). A missing baseline is saved automatically |
 | **Visual regression** | `--update-baseline` | Optional | off | (re)save this render as the baseline |
-| **Visual regression** | `--mask <sel\|x,y,w,h>` | Optional | — | ignore a region in the diff — CSS selector or rect — so dynamic zones don't cause false fails (repeatable) |
-| **Visual regression** | `--threshold <n>` | Optional | `8` | max peak per-pixel difference (0–255) to still PASS |
+| **Visual regression** | `--mask <sel\|x,y,w,h>` | Optional | — | blacken a region — CSS selector or rect — so a dynamic zone neither trips the gate nor shows in the diff (repeatable) |
 | **Auth** | `--cookies <file>` | Optional | — | inject cookies exported from your logged-in browser so gated pages render authenticated (see note below) |
 | **Help** | `--help` | Optional | — | print the full list of flags |
 
@@ -145,8 +144,14 @@ out/               output (gitignored)
   two-pass path also roughly doubles render time on Web-Audio pages.
 - No HDR output — `page.screenshot()` yields 8-bit sRGB; there is no float readback
   path for arbitrary DOM.
-- Determinism covers in-page randomness (`Math.random`/`crypto`, seeded) and
-  time, but **not** network order / live external data. No network record/replay.
+- Determinism covers in-page randomness (`Math.random`/`crypto`, seeded), time
+  (frozen clock; for VRT the start epoch is also pinned via `window.__epoch`, so a
+  real-time counter like `base + rate*(now − t0)` renders identically), and — under
+  `--baseline` — network, via HAR record/replay (record on baseline save, replay on
+  compare). Caveats: replay matches by method+URL, so **cache-busted URLs** (unique
+  query per load) and **WebSocket/SSE** streams aren't pinned; unrecorded requests
+  fall through to live network (logged). Network record/replay is **off under
+  stealth** (a recorded Cloudflare challenge is meaningless) and without `--baseline`.
 - No timeline or scene-authoring model: the tool films a single page, it is not
   a video editor. Join or decorate finished clips with a general tool (ffmpeg).
 - No SSRF protection, no parallelism, no server-side video fragmentation (large

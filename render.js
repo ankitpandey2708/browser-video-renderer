@@ -79,6 +79,12 @@ const sibling = (p, suffix) => stripExt(p) + suffix;
 // #6: fixed RNG seed injected as window.__seed, so Math.random/crypto are
 // deterministic and renders are byte-identical (the basis for --baseline VRT).
 const SEED_VALUE = 1;
+// Fixed wall-clock epoch (ms) injected as window.__epoch so the frozen clock
+// starts at the SAME absolute time every run. Without it the shim anchors to the
+// real Date.now() at load (clock-shim.js), so a real-time value like a live
+// counter (base + rate*(now - t0)) differs run to run. Pinned only for VRT and
+// never under stealth -- a stale device time trips Cloudflare's clock check.
+const EPOCH_VALUE = 1735689600000; // 2025-01-01T00:00:00Z
 
 // Advance the virtual clock by n frame-sized ticks (the page's own timers are
 // frozen, so time only moves when we tick it from Node).
@@ -108,7 +114,7 @@ function parseArgs(argv) {
                  // NEW: captions (#5), audio (#2/#4)
                  captions: false, burn: false,
                  // visual-regression (#1): render, then compare to a baseline
-                 baseline: null, threshold: null, updateBaseline: false, masks: [],
+                 baseline: null, updateBaseline: false, masks: [],
                  // auth/session: inject cookies exported from a logged-in browser
                  cookies: null };
   const rest = argv.slice(2);
@@ -143,7 +149,6 @@ function parseArgs(argv) {
     else if (a === "--captions") args.captions = true; // #5: transcribe page audio -> .srt sidecar (engine via BVR_ASR/BVR_LANG env)
     else if (a === "--burn") args.burn = true; // #5: also hardsub captions into the video
     else if (a === "--baseline") args.baseline = rest[++i]; // #1: after rendering, compare to this baseline; exit 1 on regression
-    else if (a === "--threshold") args.threshold = Number(rest[++i]); // #1: max peak pixel diff (0..255) to still PASS (default 8)
     else if (a === "--update-baseline") args.updateBaseline = true; // FR-B1: (re)save the render as the baseline
     else if (a === "--mask") args.masks.push(rest[++i]); // FR-B2: ignore a region in the diff (CSS selector or x,y,w,h) (repeatable)
     else if (a === "--cookies") args.cookies = rest[++i]; // auth: inject a cookies JSON exported from your logged-in browser (sweet-cookie format)
@@ -285,69 +290,99 @@ function ffprobeDims(file) {
   return null;
 }
 
-// #1: frame-diff / visual-regression. Compares two videos frame-by-frame via a
-// difference blend. Returns { pass, maxDiff, avgDiff, frames, diffOut } where
-// maxDiff is the peak mean per-frame luma difference (0 = pixel-identical). Also
-// writes an amplified "difference video" so you can see exactly where/when they
-// diverge. Deterministic (seeded) renders of the same page diff to 0.
+// Per-frame MD5 of the (optionally masked) VIDEO stream, via ffmpeg's framemd5
+// muxer. `-an` drops audio so the indices are pure video-frame order; the frames
+// go through the same `format=rgb24${box}` as the diff, so a masked region is
+// identical black in every frame and never flips a hash. Returns one hex hash per
+// frame. Deterministic: identical pixels -> identical hash, run to run.
+function frameHashes(file, box = "") {
+  const r = spawnSync("ffmpeg", ["-hide_banner", "-nostdin", "-i", file, "-an",
+    "-vf", `format=rgb24${box}`, "-f", "framemd5", "-"],
+    { encoding: "utf8", maxBuffer: 128 * 1024 * 1024 });
+  const hashes = [];
+  for (const line of (r.stdout || "").split("\n")) {
+    if (!line || line[0] === "#") continue; // skip framemd5 header comments
+    const cols = line.split(",");
+    const h = cols[cols.length - 1].trim(); // last column is the frame's MD5
+    if (h) hashes.push(h);
+  }
+  return hashes;
+}
+
+// #1: frame-diff / visual-regression. The gate is EXACT, not thresholded: renders
+// are byte-deterministic run to run (seeded RNG + frozen clock + deterministic
+// capture and encode -- verified), so we fingerprint every frame (framemd5) and
+// compare the two hash lists. Any differing frame -- or a differing frame count --
+// fails; there is no pixel tolerance to tune. Only when it fails do we render the
+// amplified "difference video" + worst-frame image so you can SEE what changed.
+// Masked regions are blacked out (drawbox) before both hashing and diffing, so a
+// dynamic zone neither trips the gate nor shows in the diff.
 async function diffVideos(a, b, opts = {}) {
-  // Peak allowed per-pixel difference (0..255) to still PASS. Small default
-  // tolerates trivial encode noise; any real visual change blows past it.
-  const threshold = opts.threshold != null ? Number(opts.threshold) : 8;
   if (!fs.existsSync(a)) throw new Error(`baseline not found: ${a}`);
   if (!fs.existsSync(b)) throw new Error(`file not found: ${b}`);
   const da = ffprobeDims(a), db = ffprobeDims(b);
   if (da && db && (da.w !== db.w || da.h !== db.h))
-    return { pass: false, reason: `dimension mismatch (${da.w}x${da.h} vs ${db.w}x${db.h})`, maxDiff: 255, avgDiff: 255, frames: 0 };
+    return { pass: false, reason: `dimension mismatch (${da.w}x${da.h} vs ${db.w}x${db.h})`, mismatches: [], frames: 0 };
 
   // FR-B2: mask ignored regions on BOTH inputs (identical black boxes -> those
-  // pixels diff to 0). Difference is computed in RGB -- a YUV difference blend
-  // zeroes the chroma planes and fabricates color even for identical frames.
+  // pixels are identical, so they neither flip a frame hash nor show in the diff).
   const PAD = 16; // cover JPEG block noise/ringing just outside the region
   const box = (opts.masks || []).map((r) => {
     const x = Math.max(0, Math.round(r.x) - PAD), y = Math.max(0, Math.round(r.y) - PAD);
     return `,drawbox=x=${x}:y=${y}:w=${Math.round(r.w) + 2 * PAD}:h=${Math.round(r.h) + 2 * PAD}:color=black:t=fill`;
   }).join("");
-  const prep = `[0:v]format=rgb24${box}[a];[1:v]format=rgb24${box}[b];`;
+
+  // Barcode gate: one MD5 per masked frame, compared exactly. A length difference
+  // (render got longer/shorter) is itself a regression.
+  const ha = frameHashes(a, box), hb = frameHashes(b, box);
+  const frames = Math.min(ha.length, hb.length);
+  const mismatches = [];
+  for (let i = 0; i < frames; i++) if (ha[i] !== hb[i]) mismatches.push(i);
+  const lenMismatch = ha.length !== hb.length;
+  const pass = mismatches.length === 0 && !lenMismatch;
+  const base = { pass, mismatches, lenMismatch, frames, baseFrames: ha.length, newFrames: hb.length };
+  if (pass) return base; // identical -> nothing to show, skip the diff render
 
   // Amplified difference video artifact (contrast-boosted so small diffs show).
+  // format=rgb24 AFTER blend too: eq prefers YUV and would otherwise pull blend's
+  // output into YUV via backward format negotiation -- computing the difference in
+  // YUV, which fabricates a flat color (green) even for identical frames. Pinning
+  // RGB here keeps the difference in RGB; convert to yuv420p only for the encode.
+  const prep = `[0:v]format=rgb24${box}[a];[1:v]format=rgb24${box}[b];`;
   const diffOut = opts.out || sibling(b, ".diff.mp4");
   fs.mkdirSync(path.dirname(path.resolve(diffOut)), { recursive: true });
   await withRetry("diff-video", () => runFfmpeg(["-nostdin", "-y", "-i", a, "-i", b,
-    "-filter_complex", `${prep}[a][b]blend=all_mode=difference,eq=contrast=4:brightness=0.06,format=yuv420p`,
+    "-filter_complex", `${prep}[a][b]blend=all_mode=difference,format=rgb24,eq=contrast=4:brightness=0.06,format=yuv420p`,
     "-c:v", "libx264", "-pix_fmt", "yuv420p", diffOut], { timeoutMs: 60000 }));
 
-  // Per-frame difference metric. Equalize R,G,B into gray so chroma-only changes
-  // (a color swap at the same luma) still register; read peak (YMAX) per frame,
-  // its frame index, and mean (YAVG). Metadata prints to stderr.
+  // FR-B3: save the worst-diff frame -- the mismatched frame with the largest peak
+  // pixel difference (signalstats YMAX), so the image shows the most visible change.
+  // Equalize R,G,B into gray first so a chroma-only change (same luma) still counts.
   const mix = "colorchannelmixer=.3333:.3333:.3333:0:.3333:.3333:.3333:0:.3333:.3333:.3333:0";
   const r = spawnSync("ffmpeg", ["-hide_banner", "-nostdin", "-i", a, "-i", b,
     "-filter_complex", `${prep}[a][b]blend=all_mode=difference,${mix},format=gray,signalstats,metadata=print`,
     "-f", "null", "-"], { encoding: "utf8", maxBuffer: 128 * 1024 * 1024 });
   const txt = (r.stderr || "") + (r.stdout || "");
-  let peak = 0, peakIdx = -1, sum = 0, n = 0, idx = 0, m;
+  const mm = new Set(mismatches);
+  let peak = -1, worstIndex = mismatches[0], idx = 0, m;
   const reMax = /lavfi\.signalstats\.YMAX=([0-9.]+)/g;
-  while ((m = reMax.exec(txt))) { const v = Number(m[1]); if (v > peak) { peak = v; peakIdx = idx; } idx++; }
-  const reAvg = /lavfi\.signalstats\.YAVG=([0-9.]+)/g;
-  while ((m = reAvg.exec(txt))) { sum += Number(m[1]); n++; }
-  const pass = peak <= threshold;
-
-  // FR-B3: on a regression, save the single worst-diff frame as an image.
-  let worstFrame = null;
-  if (!pass && peakIdx >= 0) {
-    worstFrame = sibling(diffOut, ".worst.png");
-    try {
-      await runFfmpeg(["-nostdin", "-y", "-i", diffOut, "-vf", `select=eq(n\\,${peakIdx})`, "-frames:v", "1", worstFrame], { timeoutMs: 30000 });
-    } catch (e) { worstFrame = null; }
-  }
-  return { pass, maxDiff: peak, avgDiff: n ? sum / n : 0, frames: n, diffOut, worstFrame, worstIndex: peakIdx };
+  while ((m = reMax.exec(txt))) { const v = Number(m[1]); if (mm.has(idx) && v > peak) { peak = v; worstIndex = idx; } idx++; }
+  let worstFrame = sibling(diffOut, ".worst.png");
+  try {
+    await runFfmpeg(["-nostdin", "-y", "-i", diffOut, "-vf", `select=eq(n\\,${worstIndex})`, "-frames:v", "1", worstFrame], { timeoutMs: 30000 });
+  } catch (e) { worstFrame = null; }
+  return { ...base, diffOut, worstFrame, worstIndex };
 }
 
 // #1: print a VRT verdict.
 function reportDiff(res) {
   if (res.reason) { console.log(`\nVRT FAIL: ${res.reason}`); return; }
-  console.log(`\nVRT ${res.pass ? "PASS" : "FAIL"}: peak pixel diff ${res.maxDiff.toFixed(1)}/255, mean ${res.avgDiff.toFixed(3)} over ${res.frames} frames`);
-  console.log(`  difference video -> ${res.diffOut}`);
+  if (res.pass) { console.log(`\nVRT PASS: all ${res.frames} frames identical`); return; }
+  const parts = [];
+  if (res.mismatches.length) parts.push(`${res.mismatches.length}/${res.frames} frames changed`);
+  if (res.lenMismatch) parts.push(`frame count differs (baseline ${res.baseFrames}, new ${res.newFrames})`);
+  console.log(`\nVRT FAIL: ${parts.join("; ")}`);
+  if (res.diffOut) console.log(`  difference video -> ${res.diffOut}`);
   if (res.worstFrame) console.log(`  worst frame (#${res.worstIndex}) -> ${res.worstFrame}`);
 }
 
@@ -590,12 +625,26 @@ function loadCookies(file) {
   });
 }
 
+// Network record/replay pins the exact bytes the page fetched, so network-driven
+// content (a live counter, API data) renders identically run to run -- the piece
+// the frozen clock + seeded RNG can't reach. It rides the --baseline lifecycle:
+// the run that (re)saves the baseline RECORDS a HAR sibling (base.mp4 -> base.har);
+// compare runs REPLAY it. Off without a baseline, for PNG sequences, and under
+// stealth (a recorded Cloudflare challenge is meaningless and replay would break
+// clearance). Returns { mode: "record"|"replay", path } or null.
+function harMode(args, isSequence) {
+  if (!args.baseline || isSequence || args._stealth) return null;
+  const record = args.updateBaseline || !fs.existsSync(args.baseline);
+  return { mode: record ? "record" : "replay", path: sibling(args.baseline, ".har") };
+}
+
 // Open a browser context for a render pass, injecting --cookies if provided.
 // In stealth mode (auto-enabled on a detected bot wall) it launches real Chrome
 // (channel) with automation flags disabled; rebrowser-patches (applied to
 // playwright-core) already fix the Runtime.enable CDP leak in the main world.
-// Returns { context, browser, close }.
-async function openBrowserContext(args, { headless }) {
+// `har` (from harMode, visual pass only) enables VCR-style network record/replay.
+// Returns { context, browser, close, missCount }.
+async function openBrowserContext(args, { headless, har }) {
   // Stealth must run headful: real Cloudflare blocks headless real-Chrome
   // indefinitely (the challenge never issues cf_clearance), whereas a headful
   // window clears the managed challenge instantly. This is why stealth needs a
@@ -604,10 +653,35 @@ async function openBrowserContext(args, { headless }) {
     ? { headless: false, channel: "chrome", args: ["--disable-blink-features=AutomationControlled"] }
     : { headless };
   const browser = await chromium.launch(launchOpts);
-  const context = await browser.newContext({
-    viewport: { width: args.width, height: args.height }, deviceScaleFactor: 1 });
+  const ctxOpts = { viewport: { width: args.width, height: args.height }, deviceScaleFactor: 1 };
+  // Record: capture every request into the HAR as the context runs; it flushes on
+  // close(). content:"embed" inlines bodies so the .har stays a single portable file.
+  if (har && har.mode === "record")
+    ctxOpts.recordHar = { path: har.path, content: "embed", mode: "full" };
+  const context = await browser.newContext(ctxOpts);
   if (args.cookies) await context.addCookies(loadCookies(args.cookies));
-  return { context, browser, close: () => browser.close() };
+  // Replay: serve recorded responses. A request not in the HAR falls through to the
+  // live network and is counted (passthrough + warn) so a stale recording is visible.
+  // The catch-all is registered FIRST (lowest precedence); routeFromHAR is checked
+  // first and only defers here via notFound:"fallback" on a genuine miss.
+  let misses = 0; const missUrls = [];
+  if (har && har.mode === "replay") {
+    if (fs.existsSync(har.path)) {
+      await context.route("**/*", (route) => {
+        misses++;
+        if (missUrls.length < 5) missUrls.push(route.request().url());
+        route.fallback();
+      });
+      await context.routeFromHAR(har.path, { update: false, notFound: "fallback" });
+      console.log(`  network: replaying from ${har.path}`);
+    } else {
+      console.log(`  network: no recording at ${har.path} -> live network (determinism reduced)`);
+    }
+  }
+  // Close the CONTEXT before the browser: Playwright flushes the recorded HAR to
+  // disk on context close, not browser close -- closing only the browser drops it.
+  return { context, browser, missCount: () => misses, missUrls: () => missUrls,
+           close: async () => { await context.close().catch(() => {}); await browser.close().catch(() => {}); } };
 }
 
 // --- bot-wall auto-detection + stealth dormant-shim load ------------------
@@ -688,7 +762,7 @@ async function navigateWithInit(page, url, initScripts, args) {
   await page.evaluate(() => { if (window.__vclock && window.__vclock.arm) window.__vclock.arm(); });
 }
 
-async function renderAudioPass(url, args, params, shim, seedVal, plannedEndSec) {
+async function renderAudioPass(url, args, params, shim, seedVal, plannedEndSec, epochVal) {
   const { context, close } = await openBrowserContext(args, { headless: true });
   try {
     const page = await context.newPage();
@@ -698,6 +772,8 @@ async function renderAudioPass(url, args, params, shim, seedVal, plannedEndSec) 
     const bufSec = auto ? AUTO_DURATION_CAP : plannedEndSec;
     const initScripts = [
       `window.__seed = ${seedVal};`,
+      // Match the visual pass's fixed epoch so any Date-derived auto-duration agrees.
+      ...(epochVal != null ? [`window.__epoch = ${epochVal};`] : []),
       `window.__audioCaptureMode = true; window.__audioDurationSec = ${bufSec};`,
       MUTATION_PROBE,
       shim,
@@ -785,13 +861,15 @@ function printHelp() {
   p("  --captions         write <out>.srt (whisper.cpp default; needs WHISPER_MODEL)");
   p("  --burn             also hardsub captions into the video");
   p("                     engine/language via env: BVR_ASR=whisper|openai, BVR_LANG=<code>");
-  p("\nVisual regression (deterministic renders diff to zero):");
-  p("  --baseline <file>  after rendering, compare to this baseline; exit 1 on regression");
-  p("                     (missing baseline is saved automatically); writes <out>.diff.mp4");
-  p("                     + <out>.diff.worst.png; catches motion + color changes");
+  p("\nVisual regression (exact per-frame hash; deterministic renders match):");
+  p("  --baseline <file>  after rendering, compare to this baseline; exit 1 on any");
+  p("                     changed frame (missing baseline is saved automatically).");
+  p("                     On failure writes <out>.diff.mp4 + <out>.diff.worst.png");
   p("  --update-baseline  (re)save this render as the baseline");
-  p("  --mask <sel|x,y,w,h>  ignore a region in the diff (CSS selector or rect; repeatable)");
-  p("  --threshold <n>    max peak pixel diff (0..255) to still PASS (default 8)");
+  p("  --mask <sel|x,y,w,h>  ignore a region (CSS selector or rect; repeatable)");
+  p("                     network is auto-recorded to <baseline>.har when the baseline");
+  p("                     is saved, and replayed on compare -- so network-driven");
+  p("                     content (live counters, API data) renders deterministically");
   p("\nAuth:");
   p("  --cookies <file>   inject cookies exported from your logged-in browser so gated");
   p("                     pages render authenticated (JSON: a cookie array or {cookies:[..]},");
@@ -848,6 +926,13 @@ async function renderOne(args, params) {
   const vcodec = containerCodec(format);
   const isSequence = format === "png"; // png = numbered image sequence in out dir
 
+  // VRT determinism controls (both non-null only for --baseline, non-stealth,
+  // non-sequence): `har` drives network record/replay (visual pass); `epochVal`
+  // pins the frozen clock's start time so Date-derived content (a live counter)
+  // renders identically run to run. Same guardrails, so they share harMode's gate.
+  const har = harMode(args, isSequence);
+  const epochVal = har ? EPOCH_VALUE : null;
+
   // Resolve the target URL, auto-serving local files over HTTP.
   const { url, server } = await resolveUrl(args);
 
@@ -884,7 +969,7 @@ async function renderOne(args, params) {
   if (audioEligible) {
     const plannedEndSec = args.end != null ? args.end : args.start + (args.duration ?? DEFAULT_DURATION);
     try {
-      const res = await renderAudioPass(url, args, params, shim, seedVal, plannedEndSec);
+      const res = await renderAudioPass(url, args, params, shim, seedVal, plannedEndSec, epochVal);
       if (res) {
         // Adopt the resolved auto-duration so the record window matches the PCM.
         if (auto) args.duration = Math.max(1, res.endSec - args.start);
@@ -896,11 +981,14 @@ async function renderOne(args, params) {
     } catch (e) { console.log(`  (audio pre-render skipped: ${e.message})`); }
   }
 
-  const { context, close } = await openBrowserContext(args, { headless: true });
+  // Network record/replay pins the page's fetched bytes to the baseline (visual
+  // pass only -- the audio pre-pass stays on live network; its output isn't gated).
+  const { context, close, missCount, missUrls } = await openBrowserContext(args, { headless: true, har });
   const page = await context.newPage();
   // Ordered init scripts (seed BEFORE shim; PCM before shim; params after shim),
   // built as a list so the stealth two-phase loader can defer them past the wall clear.
   const initScripts = [`window.__seed = ${seedVal};`]; // #6
+  if (epochVal != null) initScripts.push(`window.__epoch = ${epochVal};`); // pin Date for VRT
   if (audioPCM) // #2: feed pass-1 PCM to the AnalyserNode shim before it installs
     initScripts.push(`window.__audioPCM = { b64: ${JSON.stringify(pcmToMonoB64(audioPCM))}, sampleRate: ${audioPCM.sampleRate} };`);
   initScripts.push(MUTATION_PROBE, shim);
@@ -1166,7 +1254,18 @@ async function renderOne(args, params) {
     console.log(`  decode: ${ds.videos} video(s), ${ds.images || 0} image(s), ${ds.frames} frames decoded` +
       (ds.errors.length ? `, errors: ${ds.errors.slice(0, 3).join(" | ")}` : ""));
   }
-  await close();
+  await close(); // flushes the recorded HAR (if recording)
+
+  // Network record/replay outcome. On record the HAR is now written; on replay,
+  // surface any cache misses so a stale recording (page added a request) is visible.
+  if (har && har.mode === "record") console.log(`  network: recorded -> ${har.path}`);
+  else if (har && har.mode === "replay") {
+    const m = missCount ? missCount() : 0;
+    if (m) {
+      console.log(`  network: ${m} request(s) not in recording -> served live (determinism reduced; re-record with --update-baseline)`);
+      for (const u of (missUrls ? missUrls() : [])) console.log(`           miss: ${u}`);
+    }
+  }
 
   let muxed = 0, skipped = 0;
   const audioCodec = audioCodecFor(format);
@@ -1229,7 +1328,7 @@ async function renderOne(args, params) {
         fs.copyFileSync(outAbs, args.baseline);
         console.log(`\nVRT baseline ${args.updateBaseline ? "updated" : "saved"} -> ${args.baseline}`);
       } else {
-        const res = await diffVideos(args.baseline, outAbs, { threshold: args.threshold, masks: maskRects });
+        const res = await diffVideos(args.baseline, outAbs, { masks: maskRects });
         reportDiff(res);
         if (!res.pass) process.exitCode = 1;
       }

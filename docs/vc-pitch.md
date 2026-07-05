@@ -13,7 +13,7 @@ Point it at a URL or an AI-generated HTML file; it films the page as video — s
 A working CLI today (single machine, MIT):
 
 - **Deterministic capture of *any* page.** A fake clock replaces `Date`/`rAF`/timers in headless Chrome; we step time frame-by-frame, screenshot, encode with FFmpeg. A 60-second animation renders frame-accurately regardless of machine speed — and the page never knows it's being filmed.
-- **Drive it first** — scroll, click, type, and timed mid-capture actions (`--do "click #x@2"`).
+- **Drive it first** — click to dismiss/open (`--click`), tour the page (`--scroll`), or click on camera at a timestamp (`--click .play 2`).
 - **Repeatable renders** — seeded `Math.random`/`crypto` + a frozen clock make a page render byte-identical on the same machine/Chrome build; the basis for reliable visual diffing. (Pixel-perfect *compositor* determinism would need Chrome's `beginFrame`, removed in 147+; we pin the *timing* via `page.screenshot()`, not the compositor.)
 - **Real media** — deterministic `<video>` decode via WebCodecs, multi-clip + trim; animated GIF/APNG/WebP decoded onto the virtual clock (even on strict-CSP sites, via a CSP-exempt injection path); output mp4/webm/mov/mkv/gif, PNG sequence, transparent (alpha), and stills across h264/h265/av1/vp9/vp8/prores.
 - **The hard part — audio.** Two passes: render the page's *real* Web Audio graph on an `OfflineAudioContext` (captures **`AudioWorkletNode`** DSP), then feed that PCM back to a shimmed **`AnalyserNode`** so audio-reactive visualizers actually react — deterministically.
@@ -57,22 +57,46 @@ The addressable surface is the union of the above plus everything adjacent to sc
 
 ---
 
-## 5. Vs. the field
+## 5. The competitive field
 
-| | Remotion | HyperFrames | browser-video-renderer |
+Partition by the job the buyer is doing. Two jobs, mutually exclusive: **create** a video from scratch, or **record** a page that already exists. Every tool sits in exactly one; we are the only one built to *deterministically record a page that never cooperated*.
+
+### Create (authoring) — a different job that shares our budget
+
+You write the video in their format; the composition *is* the source. Not our lane, but named because agent-video spend often starts here.
+
+| | Remotion | HyperFrames | us |
 |---|---|---|---|
 | Input | React code | HTML + `data-*` marks | **any URL / HTML** |
 | Films pages not built for capture? | No | No | **Yes** |
 | AudioWorklet / audio-reactive capture | No | No | **Yes** |
-| Reaches bot-walled ("real web") pages? | N/A | N/A | **Yes (stealth path)** |
+| Reaches bot-walled pages? | N/A | N/A | **Yes (stealth)** |
 | Repeatability | `useCurrentFrame` | seekable libs | frozen clock + seeded RNG |
-| Maturity | v4, ~200 pkgs, 52k★ | v0.7, ships at HeyGen, 33k★ | **working demo, 0★** |
-| Scale | Lambda / Cloud Run | 24 workers / Lambda / Cloud Run | **single machine** |
+| Maturity | v4, 52k★ | v0.7, 33k★ | **working demo, 0★** |
+| Scale | Lambda / Cloud Run | Lambda / Cloud Run | **single machine** |
 | License | paid >3 staff | Apache-2.0 | MIT |
 
-Edge = a capability they don't have and aren't built for (zero-touch capture + real audio + the real web). Gaps = maturity and scale — execution, not invention.
+They can't add zero-touch capture without cutting against their core assumption (a cooperating author). Different product, not a sprint feature.
 
-**Why they won't just add it:** both models *assume a cooperating author* (Remotion's React frames, HyperFrames' `data-*` marks). Zero-touch capture of a page nobody built for it cuts against that core architecture — it's a different product, not a feature they bolt on in a sprint. Star/package counts above are as of Jul 2026.
+### Record (capture) — our job. Partition by *output*: only video-output tools compete head-on
+
+| Who | Does | Missing vs. us |
+|---|---|---|
+| **timecut / timesnap**, CCapture.js | same trick — hijacks `Date`/`rAF` for deterministic video | canvas/simple pages only — no auth, stealth, media decode, or audio |
+| **Playwright / Puppeteer** `recordVideo` | records a session; built-in, free | real-time, non-deterministic, flaky |
+| **urlbox, Browserless** (clip/GIF mode) | URL → short clip at scale; handles auth | no frame-accurate animation freeze, no audio; image-first |
+
+**Moat = the bundle, not any one trick:** clock-freeze + media seek + auth + stealth + real audio, together, on a page that never cooperated. Each row nails *one*; none has all.
+
+*Image-output tools are not video competitors — they overlap only via our optional `--baseline`:* Percy / Chromatic / Applitools / BackstopJS and screenshot APIs do deterministic **stills**. So determinism alone isn't the wedge — they have it for images — **video + determinism + uncooperative page** is.
+
+**Verdict:**
+- **Direct competitor:** timecut/timesnap — same idea, narrower; we win on real-world pages.
+- **Real threat:** the free primitive — "just use Playwright `recordVideo` + a DIY clock shim" is the actual build-vs-buy call.
+- **Adjacent:** capture-SaaS clip mode (thin video sliver); image-diff tools (only where `--baseline` reaches).
+- **Not competitors:** Remotion / HyperFrames — create ≠ record.
+
+(★ counts as of Jul 2026.)
 
 ---
 
