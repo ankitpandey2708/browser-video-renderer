@@ -76,6 +76,68 @@ list of flags.
 - **SVG SMIL** (no flag): `<animate>` / `<animateTransform>` / `<set>` timelines are seeked to virtual time (`svg.setCurrentTime`), so SMIL-animated SVGs advance deterministically instead of freezing.
 - **Transparent video** (no flag): give a `<video>` a luma-mask companion — `<video src="v.mp4" maskSrc="mask.mp4">` (or `data-mask`) — white = opaque, black = transparent. The mask's luminance becomes the canvas alpha, so the page shows through. Great for overlaying a subject with no background box.
 
+## Visual regression workflow
+
+A step-by-step guide to catching unintended visual changes. The everyday loop is
+just two commands: `--baseline` to check, add `--update-baseline` when you meant it.
+
+**1. Just render (no regression testing)**
+```bash
+node render.js https://example.com          # -> out/example.mp4 (auto-named)
+node render.js mypage.html --out out/demo.mp4 --duration 8 --size 1280x720
+```
+No baseline, no comparison — just a video.
+
+**2. Establish a baseline (first regression run)**
+```bash
+node render.js https://mypage.com --baseline baselines/mypage.mp4
+```
+The first time (baseline file absent), the tool renders the page, **saves** it as the
+golden reference (`baselines/mypage.mp4`), **records the network** it saw
+(`baselines/mypage.har`, a sibling), pins the clock, and passes — there's nothing to
+compare against yet.
+
+**3. Check for regressions (every later run)**
+```bash
+node render.js https://mypage.com --baseline baselines/mypage.mp4
+```
+Now the baseline exists, so it renders fresh (replaying the recorded network, pinning
+the clock), then compares **every frame** by exact hash:
+- **PASS** (`all N frames identical`, exit 0) — nothing changed.
+- **FAIL** (`X/N frames changed`, exit 1) — writes `out/mypage.diff.mp4` + `out/mypage.diff.worst.png` so you can *see* what changed.
+
+Exit 1 is your CI gate: `node render.js … --baseline … || echo "regression!"`.
+
+**4. Update the baseline (after an *intended* change)**
+```bash
+node render.js https://mypage.com --baseline baselines/mypage.mp4 --update-baseline
+```
+Re-saves the current render as the new reference **and** re-records the `.har`. Do this
+when you intentionally changed the page's look, or when a run warns `N request(s) not
+in recording` (your page added a network call, so the recording went stale).
+
+**5. Ignore a genuinely dynamic zone (optional)**
+```bash
+node render.js https://mypage.com --baseline baselines/mypage.mp4 --mask "#live-widget"
+node render.js https://mypage.com --baseline baselines/mypage.mp4 --mask "0,140,500,60"
+```
+`--mask` blackens a CSS selector or `x,y,w,h` rect (repeatable) so it counts toward
+neither the gate nor the diff.
+
+**Mental model**
+```
+FIRST run (no baseline yet)   → save video + record .har  → PASS
+LATER runs (baseline exists)  → replay .har, diff frames  → PASS or FAIL (exit 1)
+After an intended change      → add --update-baseline     → re-save + re-record
+Un-pinnable dynamic region    → add --mask <sel|rect>      → ignored
+```
+
+> **Why it just works:** the gate is *exact* (no tolerance to tune) because renders
+> are byte-deterministic — seeded RNG + frozen clock + pinned start epoch — and network
+> is recorded/replayed, so even a live counter or API-driven content on a page you own
+> renders identically run to run. **Off** for PNG-sequence output and under Cloudflare
+> stealth mode. Cache-busted URLs and WebSocket/SSE streams aren't pinned by replay.
+
 ## How it works
 
 - `clock-shim.js` replaces `Date`, `performance.now`, `requestAnimationFrame`,

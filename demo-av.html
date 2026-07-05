@@ -12,7 +12,13 @@
         font: 600 16px/1.2 "Segoe UI", system-ui, sans-serif;
         overflow: hidden;
       }
-      .stage { position: relative; height: 100%; }
+      /* seeded-RNG particle field (folded in from the old particles.html): it is
+         the divergence probe for demo/compare.sh. Our renderer seeds Math.random,
+         so two runs are byte-identical (self-diff = black); a real-time recorder
+         gets fresh randomness each run, so its two runs diverge (self-diff = noise).
+         Sits behind the stage; transparent, so the body gradient still shows. */
+      #bg { position: fixed; inset: 0; width: 100%; height: 100%; z-index: 0; }
+      .stage { position: relative; height: 100%; z-index: 1; }
       .ball {
         position: absolute; width: 44px; height: 44px; margin: -22px 0 0 -22px;
         border-radius: 50%;
@@ -36,6 +42,7 @@
     </style>
   </head>
   <body>
+    <canvas id="bg" width="1280" height="720"></canvas>
     <div class="stage">
       <div class="clip"><video id="clip" src="assets/clip.mp4" autoplay loop playsinline></video></div>
       <div class="ball" id="ball"></div>
@@ -46,6 +53,31 @@
       </div>
       <div class="bleep" id="bleep"></div>
     </div>
+
+    <script>
+      // Background particle field. Positions/phases seeded with Math.random; motion
+      // is time-driven (performance.now), which our renderer freezes -> deterministic.
+      // clearRect (not fillRect) keeps it transparent so the body gradient shows.
+      const bg = document.getElementById("bg"), bx = bg.getContext("2d");
+      const P = Array.from({ length: 260 }, () => ({
+        ox: Math.random() * 1280, oy: Math.random() * 720,
+        r: 3 + Math.random() * 4, amp: 20 + Math.random() * 60,
+        ph: Math.random() * 6.283, sp: 0.5 + Math.random() * 1.5,
+        hue: Math.floor(Math.random() * 360),
+      }));
+      function particles() {
+        const t = performance.now() / 1000;
+        bx.clearRect(0, 0, 1280, 720);
+        for (const p of P) {
+          const px = p.ox + Math.cos(t * p.sp + p.ph) * p.amp;
+          const py = p.oy + Math.sin(t * p.sp + p.ph) * p.amp;
+          bx.beginPath(); bx.arc(px, py, p.r, 0, 6.283);
+          bx.fillStyle = "hsl(" + p.hue + ",80%,65%)"; bx.fill();
+        }
+        requestAnimationFrame(particles);
+      }
+      requestAnimationFrame(particles);
+    </script>
 
     <script>
       const ball = document.getElementById("ball");
