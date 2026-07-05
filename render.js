@@ -3,8 +3,12 @@
 // headless Chrome. See README for arguments.
 //
 // Also supports (all optional, default = current behavior):
-//   #1 --do "<action>@<seconds>"  timed mid-capture interaction (repeatable);
-//       action = click|hover|scrollto|type|press <sel> [text/Key] | key <Key>.
+//   #1 Interaction -- a renderer only needs to *stage the shot*, so two flags:
+//        --click <sel> [s]  click a selector. No <s> = before capture (staging,
+//                           e.g. dismiss a banner); <s> = on camera at second s.
+//                           Repeatable.
+//        --scroll [a-b]     tour the whole page during capture; a-b bounds the
+//                           span in seconds (b may be "end").
 //   #4 --data <json|@file>  injected as window.__params before page scripts.
 //       (URL query params already work with no code.)
 
@@ -90,12 +94,15 @@ const contentEndMs = (page) => page.evaluate(() =>
 function parseArgs(argv) {
   const args = { url: null, fps: 30, duration: null, width: 1280, height: 720, out: null,
                  start: 0, end: null, warmup: 10000,
-                 // A: scripted interactions
-                 clicks: [], scroll: false, wait: 0,
                  // F: container inferred from --out (see renderOne)
                  // C: duration/end null => auto-derive the length from page content
-                 // #1: timed mid-capture interactions (each "<action>@<seconds>")
-                 doActions: [],
+                 // #1: the single internal action list. A renderer only needs to
+                 // *stage the shot*, so the surface is two flags -> two verbs:
+                 //   --click <sel> [s]  -> click; no s = before capture (setup),
+                 //                         s = on-camera at second s (timeline).
+                 //   --scroll [a-b]     -> whole-page tour; a-b bounds it (b may
+                 //                         be "end"). Each becomes a { verb, when }.
+                 doList: [],
                  // #4: parametrization
                  data: null,
                  // NEW: captions (#5), audio (#2/#4)
@@ -113,10 +120,25 @@ function parseArgs(argv) {
     else if (a === "--out") args.out = rest[++i];
     else if (a === "--start") args.start = Number(rest[++i]); // C1: record window start (s)
     else if (a === "--end") args.end = Number(rest[++i]); // C1: explicit record-window end (s)
-    else if (a === "--click") args.clicks.push(rest[++i]); // A: repeatable click selector
-    else if (a === "--scroll") args.scroll = true; // #3: scroll through the page DURING capture (a page tour; auto-scales length)
-    else if (a === "--wait") args.wait = Number(rest[++i]); // A: extra real-time wait (ms)
-    else if (a === "--do") args.doActions.push(rest[++i]); // #1: repeatable "<action>@<seconds>"
+    else if (a === "--click") { // #1: click a selector; optional trailing seconds = on-camera timing
+      const sel = rest[++i];
+      const nxt = rest[i + 1];
+      // A bare non-flag number after the selector switches the click to a timed,
+      // on-camera action at that second; otherwise it's a pre-capture staging click.
+      if (nxt !== undefined && !nxt.startsWith("--") && nxt.trim() !== "" && isFinite(Number(nxt))) {
+        i++;
+        args.doList.push({ verb: "click", sel, when: { kind: "at", atMs: Number(nxt) * 1000 } });
+      } else {
+        args.doList.push({ verb: "click", sel, when: { kind: "setup" } });
+      }
+    }
+    else if (a === "--scroll") { // #1: page tour; optional "<a>-<b>" (b may be "end") bounds the span
+      const nxt = rest[i + 1];
+      let fromMs = 0, toMs = Infinity;
+      const m = nxt !== undefined && !nxt.startsWith("--") && /^(\d*\.?\d+)-(\d*\.?\d+|end)$/.exec(nxt);
+      if (m) { i++; fromMs = Number(m[1]) * 1000; toMs = m[2] === "end" ? Infinity : Number(m[2]) * 1000; }
+      args.doList.push({ verb: "scroll", when: { kind: "span", fromMs, toMs } });
+    }
     else if (a === "--data") args.data = rest[++i]; // #4: inline JSON or @path -> window.__params
     else if (a === "--captions") args.captions = true; // #5: transcribe page audio -> .srt sidecar (engine via BVR_ASR/BVR_LANG env)
     else if (a === "--burn") args.burn = true; // #5: also hardsub captions into the video
@@ -444,68 +466,32 @@ async function muxAudio(silentVideo, finalOut, events, windowMs) {
   return { muxed: muxable.length, skipped };
 }
 
-// A + G: run scripted interactions after readiness and before capture. All
-// best-effort: a missing selector or a page that rejects an action never throws.
-// The page's setTimeout/rAF are frozen by the clock shim, so pacing is driven
-// from Node with REAL timers, and the virtual clock is ticked between steps so
+// Run staging clicks after readiness and before capture. All best-effort: a
+// missing selector or a page that rejects a click never throws. The page's
+// setTimeout/rAF are frozen by the clock shim, so pacing is driven from Node
+// with REAL timers, and the virtual clock is ticked between steps so
 // scroll/IntersectionObserver handlers (often scheduled via rAF) actually run.
 async function runInteractions(page, args, tickMs) {
   const tick = () => page.evaluate((dt) => window.__vclock && window.__vclock.tick(dt), tickMs).catch(() => {});
-  for (const sel of args.clicks) {
-    try {
-      const el = await page.$(sel);
-      if (el) { await el.click({ timeout: 2000 }).catch(() => {}); await tick(); }
-    } catch (e) {}
+  // Only staging clicks run here (a --click with no trailing second). Timed
+  // clicks fire in the capture loop; scroll tours are handled there too.
+  for (const a of (args.doList || [])) {
+    if (a.verb !== "click" || a.when.kind !== "setup") continue;
+    await runDoAction(page, a);
+    await tick();
   }
-  // #3: --scroll is now a during-capture tour (handled in the capture loop), not
-  // a pre-capture warm-up -- so nothing to do here for it.
-  if (args.wait > 0) await new Promise((r) => setTimeout(r, args.wait));
 }
 
-// #1: parse a "--do" spec "<action>@<seconds>" into { atMs, verb, sel, arg }.
-// Verbs: click <sel> | type <sel> <text...> | hover <sel> | scrollto <sel> |
-// press <sel> <Key> | key <Key>. The @<seconds> suffix is a point on the RECORD
-// timeline (same units as --duration). Returns null on a malformed spec.
-function parseDoAction(spec) {
-  const at = spec.lastIndexOf("@");
-  if (at < 0) { console.log(`  (--do "${spec}" missing @<seconds>; ignored)`); return null; }
-  const seconds = Number(spec.slice(at + 1));
-  const body = spec.slice(0, at).trim();
-  if (!isFinite(seconds)) { console.log(`  (--do "${spec}" bad seconds; ignored)`); return null; }
-  const sp = body.indexOf(" ");
-  const verb = (sp < 0 ? body : body.slice(0, sp)).toLowerCase();
-  const remainder = sp < 0 ? "" : body.slice(sp + 1).trim();
-  const action = { atMs: seconds * 1000, verb, sel: null, arg: null };
-  if (verb === "key") {
-    action.arg = remainder; // global keyboard press: the Key name
-  } else if (verb === "type" || verb === "press") {
-    // "type <sel> <text...>" / "press <sel> <Key>": split off the first token.
-    const s = remainder.indexOf(" ");
-    action.sel = s < 0 ? remainder : remainder.slice(0, s);
-    action.arg = s < 0 ? "" : remainder.slice(s + 1); // text may contain spaces
-  } else if (verb === "click" || verb === "hover" || verb === "scrollto") {
-    action.sel = remainder;
-  } else {
-    console.log(`  (--do "${spec}" unknown verb "${verb}"; ignored)`); return null;
-  }
-  return action;
-}
-
-// #1: execute one timed action via Playwright. Best-effort: a missing selector
-// or a rejected action logs and returns (never throws). The page's resulting
+// #1: click a selector via Playwright. Best-effort: a missing selector or a
+// rejected click logs and returns (never throws). The page's resulting
 // timers/animations are captured by the virtual clock on subsequent frames.
 async function runDoAction(page, action) {
   try {
-    if (action.verb === "key") { await page.keyboard.press(action.arg); return; }
     const el = await page.$(action.sel);
-    if (!el) { console.log(`\n  (--do ${action.verb} "${action.sel}": no match)`); return; }
-    if (action.verb === "click") await el.click({ timeout: 2000 });
-    else if (action.verb === "hover") await el.hover({ timeout: 2000 });
-    else if (action.verb === "scrollto") await el.scrollIntoViewIfNeeded({ timeout: 2000 });
-    else if (action.verb === "type") await el.type(action.arg, { timeout: 2000 });
-    else if (action.verb === "press") await el.press(action.arg, { timeout: 2000 });
+    if (!el) { console.log(`\n  (--click "${action.sel}": no match)`); return; }
+    await el.click({ timeout: 2000 });
   } catch (e) {
-    console.log(`\n  (--do ${action.verb} "${action.sel || action.arg}": ${e.message})`);
+    console.log(`\n  (--click "${action.sel}": ${e.message})`);
   }
 }
 
@@ -534,7 +520,7 @@ const MUTATION_PROBE = "window.__mutationCount=0;(function(){try{var o=new Mutat
 
 // Auto-wait until the page is visually stable: fonts ready, network idle, no DOM
 // mutations for a quiet window, and images decoded. Bounded by maxMs, driven from
-// Node with REAL timers. Replaces guessing --wait for most pages.
+// Node with REAL timers. Removes the need for a manual wait pad on most pages.
 async function autoWaitStable(page, maxMs = READY_MAX_MS, quietMs = READY_QUIET_MS) {
   const start = Date.now();
   await page.waitForLoadState("networkidle", { timeout: maxMs }).catch(() => {});
@@ -783,16 +769,16 @@ function printHelp() {
   p("  --duration <s>     fixed clip length (default: auto — derived from the page)");
   p("  --fps <n>          frames per second (default 30)");
   p("  --size <WxH>       frame size (default 1280x720)");
-  p("  --scroll           tour the page: auto-scroll top->bottom during capture (auto-scales length)");
   p("\nJust the URL usually works — length and readiness are detected automatically:");
   p("  node render.js https://example.com");
   p("\nTiming (length is auto-derived from the page unless you set one of these):");
   p("  --start <s>        start of the record window (default 0)");
   p("  --end <s>          end of the record window (length = end - start)");
-  p("\nInteraction:");
-  p("  --click <sel>      click a selector before capture (repeatable)");
-  p("  --wait <ms>        extra wait before capture (readiness is auto-detected; this is a manual pad)");
-  p('  --do "<act>@<s>"   timed action during capture: click/type/hover/scrollto/press/key (repeatable)');
+  p("\nInteraction (stage the shot):");
+  p("  --click <sel>      click before filming, e.g. dismiss a banner (repeatable)");
+  p("  --click <sel> <s>  click on camera at second <s> instead");
+  p("  --scroll           tour the whole page during capture (auto-scales length)");
+  p("  --scroll <a>-<b>   tour only between a and b seconds (<b> may be 'end')");
   p("\nData (templated renders):");
   p("  --data <json|@file>  inject as window.__params (URL query params also work)");
   p("\nCaptions (transcribe the page's own audio):");
@@ -831,9 +817,6 @@ async function main() {
     console.error("Image output (.png/.jpg) is not supported -- this tool renders video. Use a video extension (.mp4/.webm/.mov/.mkv/.gif), or an extension-less --out for a PNG frame sequence.");
     process.exit(1);
   }
-
-  // #1: parse timed mid-capture actions up front.
-  args.doList = args.doActions.map(parseDoAction).filter(Boolean);
 
   // Auto-detect a bot wall on external URLs; if walled, transparently switch to
   // stealth mode (patched Chrome + deferred clock). Local files never trigger it.
@@ -924,7 +907,7 @@ async function renderOne(args, params) {
   if (params != null) initScripts.push(`window.__params = ${JSON.stringify(params)};`); // #4
   await navigateWithInit(page, url, initScripts, args);
   // Smart readiness: wait until the page is visually stable before capturing
-  // (fonts, network idle, DOM quiet, images decoded) -- no manual --wait needed.
+  // (fonts, network idle, DOM quiet, images decoded) -- no manual pad needed.
   await autoWaitStable(page);
 
   // FR-B2: resolve --mask entries to pixel rects while the page is live. A
@@ -1015,12 +998,14 @@ async function renderOne(args, params) {
     if (s) args.duration = s;
   }
 
-  // #3/FR-C2: --scroll -- tour the page top->bottom during capture, pausing at
-  // each major section. Length scales to distance + dwell (auto) unless a fixed
-  // --duration/--end was given. Falls back to a linear scroll if no clear
-  // sections. scrollPlan is a normalized [{t,y}] keyframe list, or null (linear).
+  // #3/FR-C2: scroll tour(s) -- a --scroll [a-b] walks the page top->bottom
+  // across its span, pausing at each major section. Falls back to a linear
+  // scroll if no clear sections. scrollPlan is a normalized [{t,y}] keyframe
+  // list (spanning that tour's own window), or null (linear). When a tour runs
+  // to the end (bare --scroll, or a-end) and the length is auto, it drives duration.
+  const scrollTours = (args.doList || []).filter((a) => a.verb === "scroll" && a.when.kind === "span");
   let maxScroll = 0, scrollPlan = null;
-  if (args.scroll) {
+  if (scrollTours.length) {
     const info = await page.evaluate(() => {
       const max = Math.max(0, (document.documentElement.scrollHeight || document.body.scrollHeight || 0) - window.innerHeight);
       const tops = Array.from(document.querySelectorAll("section, header, footer, main, article"))
@@ -1045,9 +1030,9 @@ async function renderOne(args, params) {
       const T = segs.reduce((a, s) => a + s.dur, 0);
       scrollPlan = []; let acc = 0;
       for (const s of segs) { scrollPlan.push({ t: acc / T, y: s.y0 }); acc += s.dur; scrollPlan.push({ t: acc / T, y: s.y1 }); }
-      if (auto)
+      if (auto && scrollTours.some((a) => a.when.toMs === Infinity))
         args.duration = Math.min(AUTO_DURATION_CAP, Math.max(3, Math.ceil(T)));
-    } else if (auto && maxScroll > 0) {
+    } else if (auto && maxScroll > 0 && scrollTours.some((a) => a.when.toMs === Infinity)) {
       args.duration = Math.min(AUTO_DURATION_CAP, Math.max(3, Math.ceil(maxScroll / WALK_SPEED)));
     }
   }
@@ -1124,20 +1109,31 @@ async function renderOne(args, params) {
   // actions in one step fire in time order; fired[] guards against re-firing.
   const startMsOffset = args.start * 1000;
   const timed = (args.doList || [])
-    .map((a) => ({ ...a, absMs: startMsOffset + a.atMs }))
+    .filter((a) => a.when.kind === "at") // staging clicks ran pre-capture; spans are scroll tours (below)
+    .map((a) => ({ ...a, absMs: startMsOffset + a.when.atMs }))
     .sort((x, y) => x.absMs - y.absMs);
   const fired = new Array(timed.length).fill(false);
+  const recordLenMs = captureFrames * frameInterval; // "end" of a @<from>-end tour
 
   const startedAt = Date.now();
   let captured = 0;
   let prevElapsed = 0;
   for (let i = 0; i < endFrame; i++) {
-    // #3: --scroll tour -- position the scroll for this frame BEFORE ticking, so
-    // scroll-triggered handlers (IntersectionObserver / rAF) run this step.
-    if (args.scroll && maxScroll > 0) {
-      const prog = captureFrames > 1 ? Math.max(0, Math.min(1, (i - startFrame) / (captureFrames - 1))) : 1;
-      const y = scrollPlan ? scrollYAtProg(prog, scrollPlan) : maxScroll * prog; // FR-C2: dwell at sections when planned
-      await page.evaluate((yy) => window.scrollTo(0, yy), Math.round(y)).catch(() => {});
+    // #3: scroll tour -- if a scroll span is active this frame, position the
+    // scroll BEFORE ticking so scroll-triggered handlers (IntersectionObserver /
+    // rAF) run this step. When no tour is active we leave the scroll untouched,
+    // so a `scrollto@t` set earlier is not clobbered.
+    if (maxScroll > 0) {
+      const recordMs = (i - startFrame) * frameInterval;
+      const tour = scrollTours.find((a) =>
+        recordMs >= a.when.fromMs && recordMs < (a.when.toMs === Infinity ? recordLenMs : a.when.toMs));
+      if (tour) {
+        const to = tour.when.toMs === Infinity ? recordLenMs : tour.when.toMs;
+        const span = to - tour.when.fromMs;
+        const prog = span > 0 ? Math.max(0, Math.min(1, (recordMs - tour.when.fromMs) / span)) : 1;
+        const y = scrollPlan ? scrollYAtProg(prog, scrollPlan) : maxScroll * prog; // FR-C2: dwell at sections when planned
+        await page.evaluate((yy) => window.scrollTo(0, yy), Math.round(y)).catch(() => {});
+      }
     }
     await page.evaluate((dt) => window.__vclock.tick(dt), frameInterval);
     const elapsedNow = (i + 1) * frameInterval;
@@ -1241,7 +1237,13 @@ async function renderOne(args, params) {
   }
 }
 
-main().catch((err) => {
-  console.error("\nRender failed:", err);
-  process.exit(1);
-});
+// Only auto-run when invoked as the CLI entrypoint; when required (tests) just
+// expose the pure helpers.
+if (require.main === module) {
+  main().catch((err) => {
+    console.error("\nRender failed:", err);
+    process.exit(1);
+  });
+}
+
+module.exports = { parseArgs };

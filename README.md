@@ -27,7 +27,7 @@ node render.js "https://codepen.io/GreenSock/full/BaarZmV"  # Cloudflare-walled 
 node render.js <url> --scroll                            # page tour: scroll through during capture
 node render.js <url> --baseline base.mp4                 # visual-regression: exit 1 if it changed
 node render.js <url> --duration 8                        # fixed length (overrides auto)
-node render.js app.html --do "click #start@1"            # drive the UI on a timeline
+node render.js app.html --click "#start" 1               # click on camera at 1s
 node render.js demo-av.html --data '{"label":"hi","accent":"#ff5c8a"}'  # templated render (window.__params)
 node render.js scene.html --out out/v.mkv                # pick container via extension
 node render.js viz.html --captions                       # transcribe audio -> .srt
@@ -52,10 +52,8 @@ list of flags.
 | **Timing** | `--end <s>` | Optional | — | end of record window (turns auto off; length = `end − start`) |
 | **Timing** | `--fps <n>` | Optional | `30` | frames per second |
 | **Size** | `--size <WxH>` | Optional | `1280x720` | frame size, e.g. `960x540` |
-| **Interaction** | `--click <selector>` | Optional | — | click before capture (repeatable) |
-| **Interaction** | `--scroll` | Optional | off | tour: auto-scroll top→bottom *during* capture, pausing at each major section (auto-scales length) |
-| **Interaction** | `--wait <ms>` | Optional | `0` | extra real-time wait before capture |
-| **Interaction** | `--do "<action>@<s>"` | Optional | — | timed action *during* capture (repeatable): `click`/`type`/`hover`/`scrollto`/`press`/`key` |
+| **Interaction** | `--click <sel> [s]` | Optional | — | click a selector (repeatable). No `s` = before filming (staging, e.g. dismiss a banner); `s` = on camera at second `s`. |
+| **Interaction** | `--scroll [a-b]` | Optional | — | tour the whole page during capture (auto-scales length). `a-b` bounds the tour to those seconds (`b` may be `end`). |
 | **Data** | `--data <json\|@file>` | Optional | — | inject as `window.__params` before page scripts (URL query params also work) |
 | **Captions** | `--captions` | Optional | off | transcribe the page's own audio → `<out>.srt` sidecar (non-destructive) |
 | **Captions** | `--burn` | Optional | off | additionally hardsub the captions into the video |
@@ -69,7 +67,7 @@ list of flags.
 ### Notes
 
 - **Length is auto-derived by default** — from finite CSS animations, pending timers, and video durations, clamped to ≤30s, falling back to 5s. `--duration`/`--end` override.
-- **Readiness is automatic** — before capturing, the tool waits until the page is visually stable (fonts loaded, network idle, no DOM mutations for a quiet window, images decoded; capped at 8s). `--wait` is a manual pad, rarely needed.
+- **Readiness is automatic** — before capturing, the tool waits until the page is visually stable (fonts loaded, network idle, no DOM mutations for a quiet window, images decoded; capped at 8s). A page can also gate capture explicitly with `window.__renderReady`. No manual wait flag is needed.
 - **Codec per container** (fixed): mp4→h264, mkv→h264, webm→vp9, mov→prores. HDR is **not** supported (8-bit sRGB).
 - **Caption engine** is set via env (set-once, not per-render): `BVR_ASR=whisper|openai` (default `whisper`), `BVR_LANG=<code>`. whisper.cpp needs a binary (`WHISPER_CPP` or `whisper-cli` on PATH) and a model (`WHISPER_MODEL`); `openai` needs `OPENAI_API_KEY`. If the engine or audio is missing, captions are skipped — the render never fails.
 - **`--cookies` format & how to get the file:** accepts a JSON `Cookie[]` or `{ "cookies": [...] }`. On modern Chrome (v127+) cookies use App-Bound Encryption and can't be read from outside the browser, so export them from *inside* Chrome — e.g. the [`@steipete/sweet-cookie`](https://github.com/steipete/sweet-cookie) MV3 extension → "Download JSON". This carries `httpOnly` session cookies too; we replay them into a fresh context.
@@ -83,9 +81,10 @@ list of flags.
 
 - `clock-shim.js` replaces `Date`, `performance.now`, `requestAnimationFrame`,
   `setTimeout`, `setInterval` with a fake clock, injected before page code.
-- Optional interactions (`--click`/`--scroll`/`--wait`) run after load, before
-  capture; `--do "click #x@2"` runs timed actions *during* capture, so a video
-  can show a UI being driven. `--data` sets `window.__params`
+- Interactions stage the shot: `--click <sel>` runs after load, before capture
+  (e.g. dismiss a banner); `--click <sel> <s>` and `--scroll` run *during*
+  capture, so a video can show a click on camera or a page being toured.
+  `--data` sets `window.__params`
   for templated / personalized renders (URL query params also work with no code).
   Output is always video (or a PNG frame sequence for an extension-less `--out`).
 - Per frame: advance the clock by `1000/fps`, fire due callbacks, seek CSS
