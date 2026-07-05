@@ -46,6 +46,27 @@ function loadShim(file) {
   return SHARED_BROWSER_SRC + "\n" + fs.readFileSync(path.join(__dirname, file), "utf8");
 }
 
+// Inject a script's source into the live page. addScriptTag creates a real DOM
+// <script>, which strict-CSP sites (github, stripe, codepen) refuse. On that
+// refusal, fall back to CDP Runtime.evaluate: it runs the source in the page's
+// main world at global scope (script semantics, so mp4box's UMD global still
+// lands) but is NOT governed by the page CSP -- the same channel page.evaluate /
+// addInitScript use, which is why the clock shim and our probe already work
+// everywhere. Throws if the source itself errors (so decode can degrade to
+// native playback).
+async function injectScript(page, content) {
+  try {
+    await page.addScriptTag({ content });
+  } catch (e) {
+    const client = await page.context().newCDPSession(page);
+    try {
+      const r = await client.send("Runtime.evaluate", { expression: content });
+      if (r.exceptionDetails)
+        throw new Error("CDP eval: " + (r.exceptionDetails.exception?.description || r.exceptionDetails.text));
+    } finally { await client.detach().catch(() => {}); }
+  }
+}
+
 // Strip a file's extension; sibling() derives a companion path next to it
 // (e.g. sibling(outAbs, ".silent.mp4")). Used pervasively for intermediates.
 const stripExt = (p) => p.replace(/\.[^./\\]+$/i, "");
@@ -937,8 +958,33 @@ async function renderOne(args, params) {
   // addScriptTag (real <script>, global scope) -- addInitScript wraps in a
   // function, so mp4box's global would never reach window.
   const hasVideo = await page.evaluate(() => !!document.querySelector("video"));
-  const hasAnimImg = await page.evaluate(() =>
-    [...document.querySelectorAll("img")].some((i) => /\.(gif|apng|webp|png)(\?|#|$)/i.test(i.currentSrc || i.src || "")));
+  // Confirm images are *genuinely* animated before paying to inject the decoder.
+  // Extension alone lies (a .png is usually static, occasionally APNG), so we
+  // probe candidates with ImageDecoder and require frameCount > 1 -- the same
+  // test the decoder itself uses (media-decoder.js). This runs via CDP
+  // Runtime.evaluate, which is exempt from the page CSP, so it never trips the
+  // strict-CSP block; it also stops static-image pages from a pointless inject.
+  // Unreadable/cross-origin images throw here just as they would in the decoder,
+  // so skipping them loses nothing. Early-exits on the first animated hit.
+  const hasAnimImg = await page.evaluate(async () => {
+    if (typeof ImageDecoder === "undefined") return false;
+    const re = /\.(gif|apng|webp|png)(\?|#|$)/i;
+    const srcs = [...new Set([...document.querySelectorAll("img")]
+      .map((i) => i.currentSrc || i.src || "").filter((s) => s && re.test(s)))];
+    for (const src of srcs) {
+      try {
+        const resp = await fetch(src, { cache: "force-cache" });
+        const dec = new ImageDecoder({ data: await resp.arrayBuffer(),
+          type: resp.headers.get("content-type") || "image/gif" });
+        await dec.tracks.ready;
+        const track = dec.tracks.selectedTrack || dec.tracks[0];
+        const n = track ? track.frameCount : 1;
+        if (dec.close) dec.close();
+        if (n > 1) return true; // real animation -- worth injecting the decoder
+      } catch (e) { /* unreadable here == unreadable in decoder; skip */ }
+    }
+    return false;
+  }).catch(() => false);
   // The decoder is injected as a real <script> (addScriptTag) so mp4box's global
   // reaches window -- but that path is subject to the page's CSP. On strict-CSP
   // sites (codepen, stripe, ...) the inline <script> is refused; decode is only
@@ -948,8 +994,8 @@ async function renderOne(args, params) {
   if (decodeInjected) {
     try {
       if (hasVideo)
-        await page.addScriptTag({ content: fs.readFileSync(path.join(__dirname, "vendor/mp4box.iife.js"), "utf8") });
-      await page.addScriptTag({ content: loadShim("media-decoder.js") });
+        await injectScript(page, fs.readFileSync(path.join(__dirname, "vendor/mp4box.iife.js"), "utf8"));
+      await injectScript(page, loadShim("media-decoder.js"));
     } catch (e) {
       decodeInjected = false;
       console.log(`  (media decode unavailable: ${String(e.message || e).split("\n")[0]}; using native playback)`);
