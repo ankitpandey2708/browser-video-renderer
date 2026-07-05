@@ -237,6 +237,12 @@
   async function setupImage(img) {
     const src = img.currentSrc || img.src;
     if (!src || !ANIMATABLE.test(src)) return;
+    // Only take over images that are actually laid out. Players like GitHub's
+    // <animated-image> ship a hidden (display:none) duplicate <img> beside the
+    // visible one; a zero-box element gives swapToCanvas no size to copy, so the
+    // canvas would paint at the media's intrinsic resolution (a giant emoji).
+    const box = img.getBoundingClientRect();
+    if (!box.width || !box.height) return;
     const setup = beginSetup(img, "image");
     if (!setup) return;
 

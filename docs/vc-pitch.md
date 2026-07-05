@@ -13,7 +13,7 @@ Screen Studio and Arcade make a screen recording *look* produced — but a human
 A working CLI on a single machine:
 
 - **Deterministic capture of any page.** A fake clock replaces `Date`/`rAF`/timers in headless Chrome; we step time frame-by-frame, screenshot, encode with FFmpeg. A 60-second animation renders frame-accurately regardless of machine speed — and the page never knows it's being filmed.
-- **Real media.** Deterministic `<video>` decode via WebCodecs (multi-clip + trim); animated GIF/APNG/WebP on the virtual clock, even on strict-CSP sites; output mp4/webm/mov/mkv/gif, PNG sequence, transparent (alpha), across h264/h265/av1/vp9/vp8/prores.
+- **Real media.** Deterministic `<video>` decode via WebCodecs (multi-clip + trim); animated GIF/APNG/WebP on the virtual clock, even on strict-CSP sites; output mp4/webm/mov/mkv/gif, PNG sequence, transparent (alpha) — h264 (mp4/mkv), vp9 (webm), ProRes (mov).
 - **Audio — the part others punt on.** Two passes: render the page's *real* Web Audio graph on an `OfflineAudioContext` (captures **`AudioWorkletNode`** DSP), then feed that PCM back to a shimmed **`AnalyserNode`** so audio-reactive visuals actually react — deterministically.
 - **Reaches the real web.** Auto-detects Cloudflare and switches to a stealth path (real Chrome + deferred clock) so bot-walled / authenticated pages render instead of getting blocked.
 - Interactions (`--click`, `--scroll`), captions from the page's own audio, templated (`--data`) and baseline (`--baseline`) renders.
